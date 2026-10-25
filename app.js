@@ -73,7 +73,8 @@
     keyboardShortcutsEnabled: true,
     dismissShortcutHints: false,
     showShortcutHint: false,
-    shortcutHintMode: null
+    shortcutHintMode: null,
+    installHintDismissed: false
   };
 
   function uid(){ return Math.random().toString(36).slice(2,10); }
@@ -196,7 +197,7 @@
 
   // ---- Global prefs (theme/timer) — shared across every library, never deck-specific ----
   function saveGlobalPrefs(){
-    var payload = JSON.stringify({theme:state.theme, timerEnabled:state.timerEnabled, timerSeconds:state.timerSeconds, keyboardShortcutsEnabled:state.keyboardShortcutsEnabled, dismissShortcutHints:state.dismissShortcutHints, appName:state.appName, onboardingSeen:state.onboardingSeen});
+    var payload = JSON.stringify({theme:state.theme, timerEnabled:state.timerEnabled, timerSeconds:state.timerSeconds, keyboardShortcutsEnabled:state.keyboardShortcutsEnabled, dismissShortcutHints:state.dismissShortcutHints, appName:state.appName, onboardingSeen:state.onboardingSeen, installHintDismissed:state.installHintDismissed});
     storage.set(GLOBAL_PREFS_KEY, payload).catch(function(){});
   }
   function loadGlobalPrefs(){
@@ -211,6 +212,7 @@
           if(typeof data.dismissShortcutHints === 'boolean') state.dismissShortcutHints = data.dismissShortcutHints;
           if(typeof data.appName === 'string' && data.appName) state.appName = data.appName;
           if(typeof data.onboardingSeen === 'boolean') state.onboardingSeen = data.onboardingSeen;
+          if(typeof data.installHintDismissed === 'boolean') state.installHintDismissed = data.installHintDismissed;
         }catch(e){}
       }
     }).catch(function(){});
@@ -409,6 +411,7 @@
     state.keyboardShortcutsEnabled = true; state.dismissShortcutHints = false;
     state.appName = 'Vocab Drill';
     state.onboardingSeen = false;
+    state.installHintDismissed = false;
     state.welcomeNameDraft = '';
     applyTheme();
     applyAppName();
@@ -422,6 +425,7 @@
       applyAppName();
       return loadLibraryIndex();
     }).then(function(){
+      startMoveReceiver(); // before initNav, so the ?moving=1 marker is gone from the address it records
       initNav();
       if(!state.onboardingSeen && state.libraryIndex.length === 0){
         state.welcomeNameDraft = '';
@@ -541,7 +545,8 @@
 
   // Whole-library import: decks with new IDs import straight away; each ID collision
   // gets its own skip / overwrite / copy prompt.
-  function importWholeLibrary(data){
+  // onDone(importedCount), optional, runs once every deck has been handled.
+  function importWholeLibrary(data, onDone){
     if(!data.decks || !Array.isArray(data.decks)){ showToast('Could not read that file — is it a library backup?'); return; }
     var queue = data.decks.slice();
     var importedCount = 0;
@@ -550,6 +555,7 @@
       if(queue.length === 0){
         showToast('Imported ' + importedCount + ' deck' + (importedCount===1?'':'s') + '~');
         render();
+        if(onDone) onDone(importedCount);
         return;
       }
       var deck = queue.shift();
@@ -1813,6 +1819,16 @@
 
   // Library-level menu content.
   function buildLibraryMenuBody(body){
+    var mode = installMode();
+    if(mode){
+      sideMenuSection(body, 'APP', [
+        el('button',{class:'toggle-chip', onclick:function(){
+          closeSideMenu();
+          if(mode === 'prompt') runInstallPrompt();
+          else { state.installHintDismissed = false; saveGlobalPrefs(); render(); } // brings the steps card back
+        }},[icon('download'), text(mode === 'prompt' ? ' Install app' : ' Add to Home Screen')])
+      ]);
+    }
     sideMenuSection(body, null, [
       el('button',{class:'toggle-chip', onclick:function(){ closeSideMenu(); state.screen='manageLibrary'; render(); }},[icon('swap_vert'), text(' Manage library (reorder / delete)')])
     ]);
@@ -2147,7 +2163,112 @@
       wrap.appendChild(el('button',{class:'primary-btn mt-16', onclick:function(){ state.newDeckPromptOpen=true; state.newDeckDraftFolder=null; state.newDeckDraftName=''; render(); setTimeout(function(){ var i=document.querySelector('.word-edit-input'); if(i) i.focus(); },0); }},[text('+ NEW DECK')]));
     }
 
+    if(installMode() && !state.installHintDismissed) wrap.appendChild(renderInstallCard());
+
     return wrap;
+  }
+
+  // ---------------- Install prompt ----------------
+  // Chrome/Edge/Android fire beforeinstallprompt when the app can be installed; it's kept so
+  // our own button can show the browser's install dialog. iPhones/iPads have no such event,
+  // so they get the Share -> Add to Home Screen steps instead.
+  var deferredInstallPrompt = null;
+  window.addEventListener('beforeinstallprompt', function(e){
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    if(state.screen === 'library') render();
+  });
+  window.addEventListener('appinstalled', function(){
+    deferredInstallPrompt = null;
+    showToast('Installed~ Vocab Drill is with your other apps now.');
+  });
+  function isStandalone(){
+    return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+  }
+  function isIOS(){
+    return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  }
+  // 'prompt' (browser install dialog available), 'ios' (manual steps) or null (installed / not installable).
+  function installMode(){
+    if(isStandalone() || storage.isNative) return null;
+    if(deferredInstallPrompt) return 'prompt';
+    if(isIOS()) return 'ios';
+    return null;
+  }
+  function runInstallPrompt(){
+    var p = deferredInstallPrompt;
+    if(!p) return;
+    deferredInstallPrompt = null; // each prompt event can only be used once
+    p.prompt();
+    p.userChoice.then(function(){ render(); }, function(){ render(); });
+  }
+  function dismissInstallHint(){
+    state.installHintDismissed = true;
+    saveGlobalPrefs();
+    render();
+  }
+  function renderInstallCard(){
+    if(installMode() === 'prompt'){
+      return el('div',{class:'reset-progress-zone install-card'},[
+        el('div',{class:'dz-title'},[icon('download'), text(' INSTALL VOCAB DRILL')]),
+        el('p',{class:'zone-note'},[text('Add it to your home screen or desktop — it opens full-screen like an app and works offline.')]),
+        el('div',{class:'options-bar'},[
+          el('button',{class:'primary-btn grow', onclick:runInstallPrompt},[text('Install')]),
+          el('button',{class:'ghost-btn', onclick:dismissInstallHint},[text('Not now')])
+        ])
+      ]);
+    }
+    return el('div',{class:'reset-progress-zone install-card'},[
+      el('div',{class:'dz-title'},[icon('download'), text(' ADD TO YOUR HOME SCREEN')]),
+      el('p',{class:'zone-note'},[text('In Safari, tap the Share button, then "Add to Home Screen". It opens full-screen and works offline.')]),
+      el('p',{class:'zone-note'},[el('strong',{},[text('Before you do: ')]), text('the home-screen app keeps its own separate storage on iPhone and iPad. Export your library first, then import that file once inside the app.')]),
+      el('div',{class:'options-bar'},[
+        el('button',{class:'primary-btn grow', onclick:exportWholeLibrary},[icon('download'), text(' Export library')]),
+        el('button',{class:'ghost-btn', onclick:dismissInstallHint},[text('Got it')])
+      ])
+    ]);
+  }
+
+  // ---------------- Moving from the old address ----------------
+  // The old site (apps.fainaiasen.com/vocab) opens this page with ?moving=1, waits for
+  // "ready", then hands over its whole library by postMessage. Messages are only accepted
+  // from that exact origin, and the reply only goes back to it.
+  var OLD_SITE_ORIGIN = 'https://apps.fainaiasen.com';
+  function startMoveReceiver(){
+    if(!/[?&]moving=1/.test(location.search) || !window.opener) return;
+    // Drop the marker so a refresh doesn't restart the hand-over.
+    try{ history.replaceState(history.state, '', location.pathname + location.hash); }catch(e){}
+    window.addEventListener('message', function onMoveMessage(e){
+      if(e.origin !== OLD_SITE_ORIGIN || !e.data || e.data.type !== 'vd-move-library') return;
+      window.removeEventListener('message', onMoveMessage);
+      var bundle = e.data.bundle;
+      if(!bundle || !Array.isArray(bundle.decks)){
+        showToast('The move didn\'t come through — try again from the old site.');
+        return;
+      }
+      receiveMovedLibrary(bundle, function(count){
+        try{ e.source.postMessage({type:'vd-move-done', count:count}, OLD_SITE_ORIGIN); }catch(err){}
+      });
+    });
+    try{ window.opener.postMessage({type:'vd-move-ready'}, OLD_SITE_ORIGIN); }catch(e){}
+  }
+  function receiveMovedLibrary(bundle, onDone){
+    var p = bundle.prefs;
+    if(state.libraryIndex.length === 0 && p && typeof p === 'object'){
+      // Fresh start here: carry the old settings over too.
+      if(p.theme === 'light' || p.theme === 'dark') state.theme = p.theme;
+      if(typeof p.timerEnabled === 'boolean') state.timerEnabled = p.timerEnabled;
+      if(p.timerSeconds) state.timerSeconds = p.timerSeconds;
+      if(typeof p.keyboardShortcutsEnabled === 'boolean') state.keyboardShortcutsEnabled = p.keyboardShortcutsEnabled;
+      if(typeof p.dismissShortcutHints === 'boolean') state.dismissShortcutHints = p.dismissShortcutHints;
+      if(typeof p.appName === 'string' && p.appName) state.appName = p.appName;
+      applyTheme();
+      applyAppName();
+    }
+    state.onboardingSeen = true;
+    saveGlobalPrefs();
+    if(state.screen === 'welcome' || state.screen === 'onboarding'){ state.activeDeckId = null; state.screen = 'library'; }
+    importWholeLibrary({kind:'library-backup', decks:bundle.decks}, onDone);
   }
   function confirmNewDeck(name){
     name = (name||'').trim();
