@@ -78,6 +78,10 @@
 
   function uid(){ return Math.random().toString(36).slice(2,10); }
 
+  // Id of the deck whose content is actually in state.chapters. activeDeckId alone isn't
+  // proof (the Manage Library folder editor sets it without loading the deck).
+  var loadedDeckId = null;
+
   // ---------------- Parsing ----------------
   function parseVocabText(text, defaultChapter){
     var lines = text.split('\n');
@@ -294,8 +298,10 @@
     scheduleLibraryIndexUpdate();
   }
 
-  function loadDeck(id){
+  // onLoaded (optional) runs instead of the final render, whether the load succeeded or not.
+  function loadDeck(id, onLoaded){
     state.activeDeckId = id;
+    loadedDeckId = null;
     state.rawInput = '';
     state.loadDeckError = false;
     // Opening a deck abandons any half-filled "new deck" prompt, so it doesn't
@@ -316,8 +322,9 @@
           }
         }catch(e){}
       }
+      loadedDeckId = id;
       state.screen = state.chapterOrder.length ? 'select' : 'loader';
-      render();
+      if(onLoaded) onLoaded(); else render();
     }).catch(function(err){
       // A failed read is not an empty deck: the content may still be safe in storage.
       // Show an error screen with retry rather than the blank paste screen, which would
@@ -326,7 +333,7 @@
       state.loadDeckError = true;
       state.loadDeckErrorDetail = (err && (err.message || String(err))) || 'unknown error';
       state.screen = 'loadError';
-      render();
+      if(onLoaded) onLoaded(); else render();
     });
   }
 
@@ -354,6 +361,7 @@
   function createNewDeck(name){
     var id = uid() + uid();
     state.activeDeckId = id;
+    loadedDeckId = id;
     state.chapters = {}; state.chapterOrder = []; state.deckName = name || ''; state.rawInput = '';
     state.screen = 'loader';
     var chapterCount = 0, wordCount = 0;
@@ -372,6 +380,7 @@
   function deleteDeckEntirely(id){
     removeLibraryEntry(id);
     storage.delete(deckKey(id)).catch(function(){});
+    if(loadedDeckId === id) loadedDeckId = null;
     if(state.activeDeckId === id){
       state.activeDeckId = null;
       state.chapters = {}; state.chapterOrder = []; state.deckName = '';
@@ -393,6 +402,7 @@
     storage.delete(GLOBAL_PREFS_KEY).catch(function(){});
     state.libraryIndex = [];
     state.activeDeckId = null;
+    loadedDeckId = null;
     state.chapters = {}; state.chapterOrder = []; state.deckName = '';
     state.theme = 'dark';
     state.timerEnabled = false; state.timerSeconds = 12;
@@ -412,13 +422,16 @@
       applyAppName();
       return loadLibraryIndex();
     }).then(function(){
+      initNav();
       if(!state.onboardingSeen && state.libraryIndex.length === 0){
         state.welcomeNameDraft = '';
         state.screen = 'welcome';
+        nav.replaceNext = true;
+        render();
       } else {
-        state.screen = 'library';
+        // Open whatever screen the address points at (a refresh or a shared link).
+        applyRoute(location.hash);
       }
-      render();
     });
   }
 
@@ -590,6 +603,9 @@
   // ---------------- Theme ----------------
   function applyTheme(){
     document.documentElement.setAttribute('data-theme', state.theme);
+    // Matches the browser/status bar colour to the theme's background (--bg).
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if(meta) meta.setAttribute('content', state.theme === 'light' ? '#F7F4EE' : '#1C1B1F');
   }
   function applyAppName(){
     document.title = state.appName || 'Vocab Drill';
@@ -1401,7 +1417,239 @@
     return wrap;
   }
 
+  // ---------------- Navigation: addresses + back button ----------------
+  // Every screen has an address (#/deck/<id>/tab/<name> etc.), and every open pop-up adds
+  // one history "layer" on top of its screen, so the device back button closes pop-ups
+  // first, then steps back through screens. The app keeps a mirror of the history entries
+  // it created (nav.entries, saved per tab in sessionStorage so it survives a refresh);
+  // after every render, syncHistory() makes the browser history match what's on screen:
+  //   - a pop-up opened    -> push a layer entry
+  //   - a pop-up closed    -> step back over its layer entry
+  //   - an earlier screen  -> step back to it (so in-app Back buttons and device back agree)
+  //   - a new screen       -> push it (drill <-> results swap in place instead)
+  var NAV_KEY = 'vocab-drill-nav';
+  var nav = { ready:false, entries:[], idx:0, awaiting:false, applying:false, replaceNext:false };
+
+  function routeHash(){
+    var base = state.activeDeckId ? '#/deck/' + encodeURIComponent(state.activeDeckId) : '#/';
+    switch(state.screen){
+      case 'library': return '#/';
+      case 'manageLibrary': return '#/manage';
+      case 'onboarding': return '#/onboarding';
+      case 'welcome': return '#/welcome';
+      case 'chapterDetail': return base + '/tab/' + encodeURIComponent(state.activeChapter || '');
+      case 'addmore': return base + '/add';
+      case 'customtest': return base + '/custom';
+      case 'reorder': return base + '/reorder';
+      case 'flaggedDetail': return base + '/flagged';
+      case 'exportPicker': return base + '/export';
+      case 'drill': return base + '/drill';
+      case 'summary': return base + '/summary';
+      default: return base; // select, loader, loadError
+    }
+  }
+
+  // Pop-ups that the back button closes, topmost first.
+  var NAV_OVERLAYS = [
+    {open:function(){ return !!state.importCollision; }, close:null}, // must be answered: back can't dismiss it
+    {open:function(){ return !!state.confirmDialog; }, close:function(){ state.confirmDialog = null; }},
+    {open:function(){ return state.folderEditorOpen; }, close:function(){ state.folderEditorOpen = false; delete folderEditorDrafts[state.activeDeckId]; }},
+    {open:function(){ return state.showShortcutHint; }, close:function(){ state.showShortcutHint = false; }},
+    {open:function(){ return !!state.modeSheet; }, close:function(){ state.modeSheet = null; }},
+    {open:function(){ return state.sideMenuOpen; }, close:function(){ state.sideMenuOpen = false; state.sideMenuContext = null; }},
+    {open:function(){ return state.screen === 'library' && state.newDeckPromptOpen; }, close:function(){ state.newDeckPromptOpen = false; state.newDeckDraftFolder = null; state.newDeckDraftName = ''; }}
+  ];
+  function overlayCount(){ return NAV_OVERLAYS.filter(function(o){ return o.open(); }).length; }
+  function closeTopOverlays(n){
+    for(var i=0; i<NAV_OVERLAYS.length && n>0; i++){
+      var o = NAV_OVERLAYS[i];
+      if(o.open() && o.close){ o.close(); n--; }
+    }
+  }
+
+  function isDrillSlot(h){ return /\/(drill|summary)$/.test(h); }
+  // Screens that shouldn't stay in history once you've moved on from them.
+  function isTransient(h){ return h === '#/welcome' || h === '#/onboarding'; }
+
+  function navSave(){ try{ sessionStorage.setItem(NAV_KEY, JSON.stringify(nav.entries)); }catch(e){} }
+  function navPush(entry){
+    nav.entries.length = nav.idx + 1;
+    nav.entries.push(entry);
+    nav.idx++;
+    history.pushState({vd:true, idx:nav.idx}, '', entry.hash);
+  }
+  function navReplace(entry){
+    nav.entries[nav.idx] = entry;
+    history.replaceState({vd:true, idx:nav.idx}, '', entry.hash);
+  }
+  // Steps through history ourselves; the resulting popstate resumes syncHistory().
+  function navGo(delta){
+    nav.awaiting = true;
+    history.go(delta);
+    setTimeout(function(){
+      if(!nav.awaiting) return;
+      nav.awaiting = false;
+      if(history.state && history.state.vd) nav.idx = history.state.idx;
+      syncHistory();
+    }, 1500);
+  }
+
+  function initNav(){
+    try{
+      var saved = null;
+      try{ saved = JSON.parse(sessionStorage.getItem(NAV_KEY)); }catch(e){}
+      var st = history.state;
+      var hash = location.hash || '#/';
+      if(st && st.vd && saved && saved[st.idx]){
+        nav.entries = saved;
+        nav.idx = st.idx;
+        nav.entries[nav.idx].hash = hash;
+      } else {
+        nav.entries = [{hash:hash, layers:0}];
+        nav.idx = 0;
+        history.replaceState({vd:true, idx:0}, '', hash);
+      }
+      nav.ready = true;
+    }catch(e){
+      nav.ready = false; // history API unavailable (e.g. sandboxed preview): app still works, just without addresses
+    }
+  }
+
+  function syncHistory(){
+    if(!nav.ready || nav.awaiting || nav.applying || state.screen === 'loading') return;
+    try{
+      for(var guard=0; guard<12; guard++){
+        var want = {hash:routeHash(), layers:overlayCount()};
+        var cur = nav.entries[nav.idx];
+        if(cur.hash === want.hash && cur.layers === want.layers) break;
+
+        if(nav.replaceNext){
+          nav.replaceNext = false;
+          if(cur.hash !== want.hash){ navReplace({hash:want.hash, layers:cur.layers}); continue; }
+        }
+        if(cur.hash === want.hash){
+          if(want.layers > cur.layers){ navPush({hash:want.hash, layers:cur.layers + 1}); continue; }
+          navGo(want.layers - cur.layers); return;
+        }
+
+        var base = nav.idx - cur.layers; // this screen's own (layer 0) entry
+        for(var j=base-1; j>=0; j--){
+          var e = nav.entries[j];
+          if(e && !e.dead && e.layers === 0 && e.hash === want.hash){ navGo(j - nav.idx); return; }
+        }
+        if(isDrillSlot(cur.hash) && isDrillSlot(want.hash) && cur.layers === 0){ navReplace({hash:want.hash, layers:0}); continue; }
+        if(isDrillSlot(cur.hash) && base > 0){ navGo(-(cur.layers + 1)); return; }
+        if(cur.layers > 0 || isTransient(cur.hash)){
+          for(var k=base+1; k<nav.idx; k++) nav.entries[k].dead = true;
+          navReplace({hash:want.hash, layers:0});
+          continue;
+        }
+        navPush({hash:want.hash, layers:0});
+      }
+    }catch(err){
+      nav.ready = false;
+    }
+    navSave();
+  }
+
+  function parseRoute(hash){
+    return (hash || '').replace(/^#\/?/, '').split('/').filter(function(p){ return p !== ''; }).map(function(p){
+      try{ return decodeURIComponent(p); }catch(e){ return p; }
+    });
+  }
+
+  // Puts the app on the screen an address describes. Used on boot and on back/forward.
+  function applyRoute(hash){
+    var p = parseRoute(hash);
+    nav.applying = true;
+    if(p[0] === 'deck' && p[1]){
+      var id = p[1];
+      if(!state.libraryIndex.some(function(d){ return d.id === id; })){
+        state.activeDeckId = null; state.screen = 'library';
+        return finishRoute();
+      }
+      if(state.activeDeckId === id && loadedDeckId === id){
+        applyDeckRoute(p[2], p[3]);
+        return finishRoute();
+      }
+      loadDeck(id, function(){ applyDeckRoute(p[2], p[3]); finishRoute(); });
+      return;
+    }
+    if(p[0] === 'manage') state.screen = 'manageLibrary';
+    else if(p[0] === 'onboarding') state.screen = 'onboarding';
+    else if(p[0] === 'welcome'){ state.welcomeNameDraft = ''; state.screen = 'welcome'; }
+    else { state.activeDeckId = null; state.screen = 'library'; }
+    finishRoute();
+  }
+  function applyDeckRoute(sub, arg){
+    if(state.screen === 'loadError') return;
+    if(!state.chapterOrder.length){ state.screen = 'loader'; return; }
+    if(sub === 'tab' && arg && state.chapters[arg]){
+      if(state.activeChapter !== arg || state.screen !== 'chapterDetail'){ state.chapterEditMode = false; state.editingChapterName = false; }
+      state.activeChapter = arg;
+      state.screen = 'chapterDetail';
+    }
+    else if(sub === 'add') state.screen = 'addmore';
+    else if(sub === 'custom'){ if(state.screen !== 'customtest') state.customTestSelection = []; state.screen = 'customtest'; }
+    else if(sub === 'reorder') state.screen = 'reorder';
+    else if(sub === 'flagged') state.screen = 'flaggedDetail';
+    else if(sub === 'export'){ if(state.screen !== 'exportPicker') state.exportSelection = []; state.screen = 'exportPicker'; }
+    else if(sub === 'summary' && state.session) state.screen = 'summary';
+    else state.screen = 'select'; // includes a drill that can't be resumed after a refresh
+  }
+  function finishRoute(){
+    nav.applying = false;
+    if(nav.ready){
+      var cur = nav.entries[nav.idx];
+      navReplace({hash:routeHash(), layers:cur ? cur.layers : 0});
+    }
+    render();
+  }
+
+  window.addEventListener('popstate', function(e){
+    if(!nav.ready) return;
+    var st = e.state;
+    if(!st || !st.vd){
+      // The address was edited by hand: treat it as a fresh navigation.
+      nav.entries.length = nav.idx + 1;
+      nav.idx++;
+      nav.entries.push({hash:location.hash || '#/', layers:0});
+      history.replaceState({vd:true, idx:nav.idx}, '', location.hash || '#/');
+      closeTopOverlays(NAV_OVERLAYS.length);
+      applyRoute(location.hash);
+      return;
+    }
+    var prevIdx = nav.idx;
+    nav.idx = st.idx;
+    if(!nav.entries[nav.idx]) nav.entries[nav.idx] = {hash:location.hash || '#/', layers:0};
+    if(nav.awaiting){ nav.awaiting = false; syncHistory(); return; }
+
+    var target = nav.entries[nav.idx];
+    if(target.dead){ history.go(nav.idx < prevIdx ? -1 : 1); return; }
+    navSave();
+
+    if(state.importCollision){ render(); return; } // syncHistory re-adds the entry, keeping the prompt up
+    if(state.screen === 'drill' && state.session && target.hash !== routeHash()){
+      closeTopOverlays(NAV_OVERLAYS.length);
+      state.confirmDialog = { message:'Leave this drill? Your progress so far is already saved.', onYes:endSessionEarly };
+      render();
+      return;
+    }
+    if(target.hash === routeHash()){
+      closeTopOverlays(overlayCount() - target.layers);
+      render();
+      return;
+    }
+    closeTopOverlays(NAV_OVERLAYS.length);
+    applyRoute(target.hash);
+  });
+
   function render(){
+    renderScreen();
+    syncHistory();
+  }
+
+  function renderScreen(){
     app.innerHTML = '';
     if(state.screen === 'loading'){
       app.appendChild(el('div',{class:'loading-screen'},[text('Loading...')]));
@@ -2373,6 +2621,8 @@
     return wrap;
   }
   function finishRenameChapter(val){
+    // A rename changes this screen's address; replace the history entry rather than adding one.
+    nav.replaceNext = true;
     var result = renameChapter(state.activeChapter, val);
     state.editingChapterName = false;
     if(!result.ok && result.reason === 'exists'){ showToast('A chapter with that name already exists'); }
@@ -2696,4 +2946,11 @@
   applyTheme();
   render();
   bootApp();
+
+  // Offline support for the installed app (see sw.js). Skipped inside Claude previews and file:// pages.
+  if('serviceWorker' in navigator && !storage.isNative && location.protocol !== 'file:'){
+    window.addEventListener('load', function(){
+      navigator.serviceWorker.register('sw.js').catch(function(){});
+    });
+  }
 })();
